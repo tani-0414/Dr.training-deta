@@ -774,38 +774,41 @@ with st.sidebar:
     st.caption("Dr.training")
     st.divider()
 
-    # 単月 / 期間 の切り替え
-    mode = st.radio("表示モード", ["単月", "期間"], horizontal=True)
-
-    if mode == "単月":
-        selected_ym = st.selectbox("対象月", all_months, format_func=fmt_month)
-        ym_range    = [selected_ym]
-        period_label = fmt_month(selected_ym)
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            start_ym = st.selectbox("開始月", all_months_asc, format_func=fmt_month, index=0)
-        with c2:
-            end_ym = st.selectbox("終了月", all_months_asc, format_func=fmt_month,
-                                  index=len(all_months_asc) - 1)
-        if start_ym > end_ym:
-            st.warning("⚠️ 開始月が終了月より後になっています")
-            ym_range = []
-        else:
-            ym_range = [ym for ym in all_months_asc if start_ym <= ym <= end_ym]
-        period_label = f"{fmt_month(start_ym)} 〜 {fmt_month(end_ym)}"
-
+    # ── データ粒度の切り替え ──────────────────────────────────
+    granularity = st.radio("データ粒度", ["📊 月次", "📅 週次"], horizontal=True)
     st.divider()
 
-    # 期間にデータがある店舗のみ表示
-    stores_for_period = sorted(
-        {lbl for lbl, d in store_data.items() if any(ym in d for ym in ym_range)}
-    )
-    selected_store = st.selectbox(
-        "店舗",
-        stores_for_period,
-        format_func=clean_label,
-    )
+    if granularity == "📊 月次":
+        # 単月 / 期間 の切り替え
+        mode = st.radio("表示モード", ["単月", "期間"], horizontal=True)
+        if mode == "単月":
+            selected_ym  = st.selectbox("対象月", all_months, format_func=fmt_month)
+            ym_range     = [selected_ym]
+            period_label = fmt_month(selected_ym)
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                start_ym = st.selectbox("開始月", all_months_asc, format_func=fmt_month, index=0)
+            with c2:
+                end_ym = st.selectbox("終了月", all_months_asc, format_func=fmt_month,
+                                      index=len(all_months_asc) - 1)
+            if start_ym > end_ym:
+                st.warning("⚠️ 開始月が終了月より後になっています")
+                ym_range = []
+            else:
+                ym_range = [ym for ym in all_months_asc if start_ym <= ym <= end_ym]
+            period_label = f"{fmt_month(start_ym)} 〜 {fmt_month(end_ym)}"
+
+        stores_available = sorted(
+            {lbl for lbl, d in store_data.items() if any(ym in d for ym in ym_range)}
+        )
+    else:
+        # 週次モードは直近N週で表示（期間選択不要）
+        ym_range     = all_months       # 後続の一部処理で使われる変数をデフォルト設定
+        period_label = "週次"
+        stores_available = sorted(store_data.keys())
+
+    selected_store = st.selectbox("店舗", stores_available, format_func=clean_label)
 
     st.divider()
     if st.button("🔄 データを再読み込み"):
@@ -816,32 +819,130 @@ with st.sidebar:
     st.caption("データは1日1回更新（手動更新は上のボタン）")
 
 
-# ── 期間データの集計 ──────────────────────────────────────────
-if not ym_range:
-    st.warning("期間を正しく選択してください")
-    st.stop()
-
-eff_store  = get_effective_store(store_data, ym_range)
-eff_staff  = get_effective_staff(all_staff_data, selected_store, ym_range)
-avg_s      = _avgs(eff_store)
-avg_st     = _avgs(eff_staff)
-period_key = period_label  # コメントの紐付けキー（例: "2026年4月" / "2026年1月 〜 2026年4月"）
-
-
 # ── ヘッダー ──────────────────────────────────────────────────
-months_note = f"（{len(ym_range)}ヶ月集計）" if len(ym_range) > 1 else ""
-st.title(f"{selected_store}")
-st.caption(f"{period_label}{months_note}　|　データ: 統合版")
+st.title(clean_label(selected_store))
+
+if granularity == "📊 月次":
+    if not ym_range:
+        st.warning("期間を正しく選択してください")
+        st.stop()
+    months_note = f"（{len(ym_range)}ヶ月集計）" if len(ym_range) > 1 else ""
+    st.caption(f"📊 月次　|　{period_label}{months_note}")
+else:
+    st.caption("📅 週次")
 st.divider()
 
+# ── 月次用集計（月次モード時のみ実行）────────────────────────
+if granularity == "📊 月次":
+    eff_store  = get_effective_store(store_data, ym_range)
+    eff_staff  = get_effective_staff(all_staff_data, selected_store, ym_range)
+    avg_s      = _avgs(eff_store)
+    avg_st     = _avgs(eff_staff)
+    period_key = period_label
 
 # ── タブ ──────────────────────────────────────────────────────
-tab_summary, tab_store, tab_staff, tab_weekly = st.tabs([
-    "🏢 全店舗サマリー",
-    "📈 店舗実績",
-    "👤 スタッフ別",
-    "📅 週次推移",
-])
+if granularity == "📊 月次":
+    tab_summary, tab_store, tab_staff = st.tabs([
+        "🏢 全店舗サマリー",
+        "📈 店舗実績",
+        "👤 スタッフ別",
+    ])
+else:
+    tab_weekly_main, tab_weekly_staff = st.tabs([
+        "📅 週次サマリー",
+        "👤 スタッフ別（週次）",
+    ])
+
+# ── 週次モードのコンテンツ（月次コードより先に実行し st.stop() で終了）────
+if granularity == "📅 週次":
+    _wl_base = dict(margin=dict(l=0, r=10, t=30, b=10), xaxis_title="", yaxis_title="", height=260)
+
+    fact_df_w = load_member_data()
+    sc_w      = get_store_codes(selected_store)
+
+    with tab_weekly_main:
+        st.caption("📅 週次指標：セッション数・来店会員数・新規数・CVR")
+        st.caption("⚠️ 離脱数・復帰数・会員増減数は月次のみ対応")
+        st.divider()
+
+        n_weeks   = st.select_slider("表示週数", options=[4, 8, 12, 16, 24], value=12)
+        df_weekly = build_weekly_store_df(fact_df_w, sc_w, n_weeks=n_weeks)
+
+        if df_weekly.empty:
+            st.info("週次データがありません")
+        else:
+            if len(df_weekly) >= 2:
+                latest = df_weekly.iloc[-1]
+                prev   = df_weekly.iloc[-2]
+                m1, m2, m3, m4 = st.columns(4)
+                def _wm(col, label, key):
+                    v = latest.get(key)
+                    p = prev.get(key)
+                    d = round(v - p, 1) if isinstance(v, (int,float)) and isinstance(p, (int,float)) else None
+                    col.metric(label, str(v) if v is not None else "—",
+                               delta=f"{d:+.1f}" if d is not None else None)
+                _wm(m1, "来店会員数（直近週）", "来店会員数")
+                _wm(m2, "セッション数（直近週）", "セッション数")
+                _wm(m3, "新規獲得数（直近週）", "新規獲得数")
+                _wm(m4, "CVR（直近週）", "CVR(%)")
+                st.caption(f"▲▼ は前週（{prev['週']}）との比較")
+
+            st.divider()
+            r1l, r1r = st.columns(2)
+            with r1l:
+                st.caption("セッション数（週別）")
+                fig = px.bar(df_weekly, x="週", y="セッション数",
+                             color_discrete_sequence=["#4a90d9"])
+                fig.update_layout(**_wl_base)
+                st.plotly_chart(fig, use_container_width=True)
+            with r1r:
+                st.caption("来店会員数（週別）")
+                fig = px.line(df_weekly, x="週", y="来店会員数",
+                              markers=True, color_discrete_sequence=["#6366f1"])
+                fig.update_traces(line_width=2.5, marker_size=7)
+                fig.update_layout(**_wl_base)
+                st.plotly_chart(fig, use_container_width=True)
+
+            r2l, r2r = st.columns(2)
+            with r2l:
+                st.caption("新規数・新規獲得数（週別）")
+                df_mw = df_weekly.melt(id_vars="週", value_vars=["新規数", "新規獲得数"],
+                                       var_name="指標", value_name="件数")
+                fig = px.bar(df_mw, x="週", y="件数", color="指標", barmode="group",
+                             color_discrete_map={"新規数": "#a3c4f3", "新規獲得数": "#4a90d9"},
+                             height=260)
+                fig.update_layout(**_wl_base,
+                                  legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+                st.plotly_chart(fig, use_container_width=True)
+            with r2r:
+                st.caption("CVR（週別）")
+                fig = px.line(df_weekly.dropna(subset=["CVR(%)"]),
+                              x="週", y="CVR(%)",
+                              markers=True, color_discrete_sequence=["#f0a500"])
+                fig.update_traces(line_width=2.5, marker_size=7)
+                fig.update_layout(**_wl_base)
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.divider()
+            st.subheader("週次データ一覧")
+            st.dataframe(df_weekly, use_container_width=True)
+
+    with tab_weekly_staff:
+        st.caption("📅 週次指標（スタッフ別）")
+        st.divider()
+        n_weeks_s  = st.select_slider("表示週数", options=[4, 8, 12, 16, 24],
+                                      value=12, key="ws_slider")
+        df_wstaff  = build_weekly_staff_df(fact_df_w, sc_w, n_weeks=n_weeks_s)
+        if df_wstaff.empty:
+            st.info("データがありません")
+        else:
+            staff_list_w = sorted(df_wstaff["スタッフ"].unique())
+            sel_w = st.selectbox("スタッフを絞り込む", ["全員"] + staff_list_w,
+                                 key="ws_staff_sel")
+            show = df_wstaff if sel_w == "全員" else df_wstaff[df_wstaff["スタッフ"] == sel_w]
+            st.dataframe(show.reset_index(drop=True), use_container_width=True)
+
+    st.stop()  # 以降の月次コードは実行しない
 
 
 # ── Tab 1: 全店舗サマリー ──────────────────────────────────────
@@ -1229,97 +1330,3 @@ with tab_staff:
                 st.divider()
                 render_comments(period_key, selected_store, selected_staff)
 
-
-# ── Tab 4: 週次推移 ───────────────────────────────────────────
-with tab_weekly:
-    st.subheader(f"週次推移（{clean_label(selected_store)}）")
-    st.caption("⚠️ 週次で確認できるのは セッション数・来店会員数・新規数・CVR のみです（離脱数は月次のみ）")
-
-    n_weeks = st.select_slider("表示週数", options=[4, 8, 12, 16, 24], value=12)
-
-    fact_df_w  = load_member_data()
-    sc_w       = get_store_codes(selected_store)
-    df_weekly  = build_weekly_store_df(fact_df_w, sc_w, n_weeks=n_weeks)
-
-    if df_weekly.empty:
-        st.info("週次データがありません")
-    else:
-        # ── KPI サマリー（直近週 vs 前週）──────────────────────
-        if len(df_weekly) >= 2:
-            latest = df_weekly.iloc[-1]
-            prev   = df_weekly.iloc[-2]
-            m1, m2, m3, m4 = st.columns(4)
-            def week_metric(col, label, key):
-                v = latest.get(key)
-                p = prev.get(key)
-                delta = round(v - p, 1) if isinstance(v, (int, float)) and isinstance(p, (int, float)) else None
-                col.metric(label, str(v) if v is not None else "—",
-                           delta=f"{delta:+.1f}" if delta is not None else None)
-            week_metric(m1, "来店会員数（直近週）", "来店会員数")
-            week_metric(m2, "セッション数（直近週）", "セッション数")
-            week_metric(m3, "新規獲得数（直近週）", "新規獲得数")
-            week_metric(m4, "CVR（直近週）", "CVR(%)")
-            st.caption(f"▲▼ は前週（{df_weekly.iloc[-2]['週']}）との比較")
-
-        st.divider()
-
-        # ── 週次トレンドグラフ（2行）────────────────────────────
-        _wl = dict(margin=dict(l=0, r=10, t=30, b=10), xaxis_title="", yaxis_title="", height=260)
-
-        row1_l, row1_r = st.columns(2)
-        with row1_l:
-            st.caption("セッション数（週別）")
-            fig_s = px.bar(df_weekly, x="週", y="セッション数",
-                           color_discrete_sequence=["#4a90d9"])
-            fig_s.update_layout(**_wl)
-            st.plotly_chart(fig_s, use_container_width=True)
-
-        with row1_r:
-            st.caption("来店会員数（週別）")
-            fig_v = px.line(df_weekly, x="週", y="来店会員数",
-                            markers=True, color_discrete_sequence=["#6366f1"])
-            fig_v.update_traces(line_width=2.5, marker_size=7)
-            fig_v.update_layout(**_wl)
-            st.plotly_chart(fig_v, use_container_width=True)
-
-        row2_l, row2_r = st.columns(2)
-        with row2_l:
-            st.caption("新規数・新規獲得数（週別）")
-            df_melt_w = df_weekly.melt(id_vars="週", value_vars=["新規数", "新規獲得数"],
-                                        var_name="指標", value_name="件数")
-            fig_n = px.bar(df_melt_w, x="週", y="件数", color="指標", barmode="group",
-                           color_discrete_map={"新規数": "#a3c4f3", "新規獲得数": "#4a90d9"},
-                           height=260)
-            fig_n.update_layout(**_wl,
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
-            st.plotly_chart(fig_n, use_container_width=True)
-
-        with row2_r:
-            st.caption("CVR（週別）")
-            fig_c = px.line(df_weekly.dropna(subset=["CVR(%)"]),
-                            x="週", y="CVR(%)",
-                            markers=True, color_discrete_sequence=["#f0a500"])
-            fig_c.update_traces(line_width=2.5, marker_size=7)
-            fig_c.update_layout(**_wl)
-            st.plotly_chart(fig_c, use_container_width=True)
-
-        st.divider()
-
-        # ── 週次テーブル ────────────────────────────────────────
-        st.subheader("週次データ一覧")
-        st.dataframe(df_weekly, use_container_width=True)
-
-        st.divider()
-
-        # ── スタッフ別週次 ──────────────────────────────────────
-        with st.expander("スタッフ別 週次データを表示"):
-            df_wstaff = build_weekly_staff_df(fact_df_w, sc_w, n_weeks=n_weeks)
-            if df_wstaff.empty:
-                st.info("データがありません")
-            else:
-                staff_list_w = sorted(df_wstaff["スタッフ"].unique())
-                sel_w = st.selectbox("スタッフを絞り込む", ["全員"] + staff_list_w,
-                                     key="weekly_staff_sel")
-                if sel_w != "全員":
-                    df_wstaff = df_wstaff[df_wstaff["スタッフ"] == sel_w]
-                st.dataframe(df_wstaff.reset_index(drop=True), use_container_width=True)
