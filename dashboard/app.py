@@ -69,6 +69,96 @@ def load_data() -> tuple[dict, dict, str]:
     return parse_store_sheet(store_rows), parse_staff_sheet_all(staff_rows), loaded_at
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_comments() -> pd.DataFrame:
+    """コメントシートを読み込む（1分キャッシュ）"""
+    try:
+        gc = _gc()
+        ss = gc.open_by_key(SHINKI_SS_ID)
+        try:
+            ws = ss.worksheet("コメント")
+        except gspread.exceptions.WorksheetNotFound:
+            return pd.DataFrame(columns=["投稿日時", "対象期間", "店舗", "スタッフ", "投稿者", "コメント"])
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return pd.DataFrame(columns=["投稿日時", "対象期間", "店舗", "スタッフ", "投稿者", "コメント"])
+        return pd.DataFrame(rows[1:], columns=rows[0])
+    except Exception:
+        return pd.DataFrame(columns=["投稿日時", "対象期間", "店舗", "スタッフ", "投稿者", "コメント"])
+
+
+def post_comment(period: str, store: str, staff: str, author: str, text: str) -> bool:
+    """コメントを Google Sheets のコメントシートに追記する"""
+    try:
+        gc = _gc()
+        ss = gc.open_by_key(SHINKI_SS_ID)
+        try:
+            ws = ss.worksheet("コメント")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title="コメント", rows=2000, cols=6)
+            ws.append_row(["投稿日時", "対象期間", "店舗", "スタッフ", "投稿者", "コメント"])
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ws.append_row([now, period, store, staff, author, text])
+        return True
+    except Exception:
+        return False
+
+
+def render_comments(
+    period_key: str,
+    store_label: str,
+    staff_label: str = "",
+) -> None:
+    """コメント一覧と投稿フォームを表示する"""
+    st.subheader("💬 コメント")
+
+    comments_df = load_comments()
+
+    # 表示対象を絞り込む
+    if not comments_df.empty:
+        mask = (
+            (comments_df["対象期間"] == period_key) &
+            (comments_df["店舗"] == store_label)
+        )
+        if staff_label:
+            mask &= (comments_df["スタッフ"] == staff_label)
+        filtered = comments_df[mask].sort_values("投稿日時", ascending=False)
+    else:
+        filtered = comments_df
+
+    # コメント一覧
+    if filtered.empty:
+        st.caption("まだコメントはありません")
+    else:
+        for _, row in filtered.iterrows():
+            with st.container():
+                col_a, col_b = st.columns([1, 5])
+                with col_a:
+                    st.markdown(f"**{row['投稿者']}**  \n{row['投稿日時'][:10]}")
+                with col_b:
+                    st.markdown(row["コメント"])
+                st.divider()
+
+    # 投稿フォーム
+    form_key = f"cf_{period_key}_{store_label}_{staff_label}"
+    with st.form(key=form_key, clear_on_submit=True):
+        author = st.text_input("投稿者名")
+        text   = st.text_area("コメント内容", height=100)
+        if st.form_submit_button("📨 送信"):
+            if not author.strip():
+                st.warning("投稿者名を入力してください")
+            elif not text.strip():
+                st.warning("コメントを入力してください")
+            else:
+                ok = post_comment(period_key, store_label, staff_label, author.strip(), text.strip())
+                if ok:
+                    load_comments.clear()
+                    st.success("投稿しました！")
+                    st.rerun()
+                else:
+                    st.error("投稿に失敗しました。再度お試しください。")
+
+
 @st.cache_data(ttl=86400, show_spinner="👥 会員データを読み込み中...")
 def load_member_data() -> pd.DataFrame:
     """ファクトテーブルから必要列だけ取得（1日キャッシュ）"""
@@ -636,10 +726,11 @@ if not ym_range:
     st.warning("期間を正しく選択してください")
     st.stop()
 
-eff_store = get_effective_store(store_data, ym_range)
-eff_staff = get_effective_staff(all_staff_data, selected_store, ym_range)
-avg_s     = _avgs(eff_store)
-avg_st    = _avgs(eff_staff)
+eff_store  = get_effective_store(store_data, ym_range)
+eff_staff  = get_effective_staff(all_staff_data, selected_store, ym_range)
+avg_s      = _avgs(eff_store)
+avg_st     = _avgs(eff_staff)
+period_key = period_label  # コメントの紐付けキー（例: "2026年4月" / "2026年1月 〜 2026年4月"）
 
 
 # ── ヘッダー ──────────────────────────────────────────────────
@@ -818,6 +909,9 @@ with tab_store:
             with c3: st.metric("うち 新規（未CV）", n_uncv)
             st.dataframe(style_member_df(df_members), use_container_width=True)
 
+        st.divider()
+        render_comments(period_key, selected_store)
+
 
 # ── Tab 3: スタッフ別 ─────────────────────────────────────────
 with tab_staff:
@@ -950,6 +1044,9 @@ with tab_staff:
                 st.caption(f"来店会員 {len(df_mem_all)}名")
                 st.dataframe(style_member_df(df_mem_all), use_container_width=True)
 
+            st.divider()
+            render_comments(period_key, selected_store)
+
         else:
             st.subheader(f"{selected_staff}　vs　店舗平均")
 
@@ -1032,3 +1129,6 @@ with tab_staff:
                 else:
                     st.caption(f"担当会員 {len(df_mem_staff)}名")
                     st.dataframe(style_member_df(df_mem_staff), use_container_width=True)
+
+                st.divider()
+                render_comments(period_key, selected_store, selected_staff)
