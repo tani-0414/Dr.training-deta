@@ -437,25 +437,55 @@ def _avgs(effective: dict) -> dict:
 # ── DataFrame ビルダー ────────────────────────────────────────
 
 def _style_col(series: pd.Series, avg: float | None, higher_better: bool) -> list[str]:
+    """2段階の色分け: 10%以上乖離 → 濃い色 / 2〜10% → 薄い色"""
     styles = []
     for val in series:
         if not isinstance(val, (int, float)) or avg is None:
             styles.append("")
             continue
-        if val > avg * 1.02:
-            styles.append("background-color:#d4edda;color:#155724" if higher_better else "background-color:#f8d7da;color:#721c24")
-        elif val < avg * 0.98:
-            styles.append("background-color:#f8d7da;color:#721c24" if higher_better else "background-color:#d4edda;color:#155724")
-        else:
+        if avg == 0:
             styles.append("")
+            continue
+        ratio = (val - avg) / abs(avg)
+        good  = ratio > 0 if higher_better else ratio < 0
+        gap   = abs(ratio)
+        if gap < 0.02:
+            styles.append("")
+        elif gap < 0.10:
+            styles.append("background-color:#d4edda;color:#155724" if good else "background-color:#fde8c8;color:#7a3c00")
+        else:
+            styles.append("background-color:#c3e6cb;color:#0d4f20;font-weight:600" if good else "background-color:#f5b7b1;color:#6b0000;font-weight:700")
     return styles
 
 
-def build_store_df(effective: dict[str, dict]) -> pd.DataFrame:
+def _count_bad(r: dict, avgs: dict) -> int:
+    """平均を10%以上下回っている指標の数"""
+    checks = [
+        ("active",       avgs.get("active"),      True),
+        ("shinki_cv",    avgs.get("shinki_cv"),   True),
+        ("cvr",          avgs.get("cvr"),         True),
+        ("risseki_rate", avgs.get("risseki_rate"),False),
+        ("zougen",       avgs.get("zougen"),      True),
+    ]
+    n = 0
+    for key, avg, hb in checks:
+        val = _float(r.get(key)) if key in ("cvr", "risseki_rate") else r.get(key)
+        if not isinstance(val, (int, float)) or not avg or avg == 0:
+            continue
+        ratio = (val - avg) / abs(avg)
+        if (hb and ratio < -0.10) or (not hb and ratio > 0.10):
+            n += 1
+    return n
+
+
+def build_store_df(effective: dict[str, dict], avgs: dict | None = None) -> pd.DataFrame:
     records = []
     for lbl, r in effective.items():
+        n_bad = _count_bad(r, avgs) if avgs else 0
+        badge = f"  ⚠️×{n_bad}" if n_bad >= 2 else ("  ⚠️" if n_bad == 1 else "")
         records.append({
-            "店舗":          lbl,
+            "店舗":          lbl + badge,
+            "_raw":          lbl,
             "アクティブ会員": r.get("active"),
             "新規数":         r.get("shinki"),
             "新規獲得数":     r.get("shinki_cv"),
@@ -632,19 +662,22 @@ with tab_summary:
     st.subheader(f"全店舗サマリー（{period_label}）")
     st.caption("全店舗平均との比較　｜　🟢 平均+2%以上　🔴 平均-2%以下")
 
-    df_store = build_store_df(eff_store)
+    df_store = build_store_df(eff_store, avgs=avg_s)
     if df_store.empty:
         st.info("選択期間のデータがありません")
     else:
-        df_display = df_store.copy()
-        df_display["店舗"] = df_display["店舗"].apply(clean_label)
-        target_clean = clean_label(selected_store)
+        df_display = df_store.drop(columns=["_raw"]).copy()
+        df_display["店舗"] = df_display["店舗"].apply(
+            lambda s: re.sub(r'（\d+(?:\+\d+)*）', '', s.split("  ⚠")[0])
+                      + ("  " + s.split("  ")[1] if "  ⚠" in s else "")
+        )
+        target_badge = clean_label(selected_store)
 
         styled = style_store_df(df_display, avg_s)
 
         def highlight_target(row):
             return ["font-weight:bold; background-color:#fff8e1"] * len(row) \
-                if row["店舗"] == target_clean else [""] * len(row)
+                if row["店舗"].startswith(target_badge) else [""] * len(row)
         styled = styled.apply(highlight_target, axis=1)
 
         row_height = 35
@@ -676,6 +709,36 @@ with tab_store:
     if not tr:
         st.info("選択店舗・期間のデータがありません")
     else:
+        # ── 要注意指標アラート ────────────────────────────────
+        alert_defs = [
+            ("アクティブ会員数", "active",       True,  False, "人"),
+            ("新規獲得数",       "shinki_cv",    True,  False, "人"),
+            ("CVR",              "cvr",          True,  True,  "pt"),
+            ("離脱率",           "risseki_rate", False, True,  "pt"),
+            ("会員増減数",       "zougen",       True,  False, ""),
+        ]
+        alerts = []
+        for label, key, hb, is_rate, unit in alert_defs:
+            val = _float(tr.get(key)) if is_rate else tr.get(key)
+            avg = avg_s.get(key)
+            if not isinstance(val, (int, float)) or not avg or avg == 0:
+                continue
+            ratio = (val - avg) / abs(avg)
+            bad = (hb and ratio < -0.10) or (not hb and ratio > 0.10)
+            if bad:
+                diff = val - avg
+                sign = "+" if diff > 0 else ""
+                avg_disp = f"{avg:.1f}{'%' if is_rate else ''}"
+                val_disp = f"{val:.1f}{'%' if is_rate else ''}"
+                diff_disp = f"{sign}{diff:.1f}{unit}"
+                alerts.append(f"**{label}**　実績 {val_disp}　平均 {avg_disp}　差 {diff_disp}")
+
+        if alerts:
+            alert_md = "\n\n".join(f"🔴 {a}" for a in alerts)
+            st.error(f"⚠️ **要注意指標が {len(alerts)} 項目あります**\n\n{alert_md}")
+        else:
+            st.success("✅ すべての指標が全店舗平均以上（±10%以内）です")
+
         kpi_defs = [
             ("アクティブ会員数", "active",       True,  False),
             ("新規数",           "shinki",       True,  False),
