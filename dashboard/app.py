@@ -169,7 +169,7 @@ def load_member_data() -> pd.DataFrame:
     headers = all_rows[0]
     col = {h: i for i, h in enumerate(headers)}
 
-    keep = ["年月", "店舗コード", "会員ID", "姓", "名", "会員ランク名",
+    keep = ["取引日時", "年月", "店舗コード", "会員ID", "姓", "名", "会員ランク名",
             "スタッフID", "スタッフ名", "初回", "CV有無",
             "取消区分 (0:通常、1：取消)"]
     missing = [c for c in keep if c not in col]
@@ -429,6 +429,101 @@ def get_staff_session_counts(
     if not mask.any():
         return {}
     return fact_df[mask].groupby("スタッフID").size().to_dict()
+
+
+# ── 週次集計 ─────────────────────────────────────────────────
+
+def _parse_dt(fact_df: pd.DataFrame) -> pd.DataFrame:
+    """取引日時を datetime に変換して週開始日（月曜）を付与する"""
+    df = fact_df.copy()
+    df["_dt"] = pd.to_datetime(df["取引日時"], errors="coerce")
+    df = df.dropna(subset=["_dt"])
+    df["_week"] = df["_dt"].dt.to_period("W-SUN").apply(lambda p: p.start_time)
+    return df
+
+
+def _week_label(start: "pd.Timestamp") -> str:
+    end = start + pd.Timedelta(days=6)
+    return f"{start.month}/{start.day}〜{end.month}/{end.day}"
+
+
+def build_weekly_store_df(
+    fact_df: pd.DataFrame,
+    store_codes: list[str],
+    n_weeks: int = 12,
+) -> pd.DataFrame:
+    """店舗の週別メトリクスを返す（直近 n_weeks 週）"""
+    df = _parse_dt(fact_df[fact_df["店舗コード"].isin(store_codes)])
+    if df.empty:
+        return pd.DataFrame()
+
+    records = []
+    for week_start, grp in df.groupby("_week"):
+        shinki   = grp[grp["初回"] == "1"]["会員ID"].nunique()
+        cv       = grp[(grp["初回"] == "1") & (grp["CV有無"] == "1")]["会員ID"].nunique()
+        records.append({
+            "_week_start": week_start,
+            "週":          _week_label(week_start),
+            "来店会員数":  grp["会員ID"].nunique(),
+            "セッション数": len(grp),
+            "新規数":      shinki,
+            "新規獲得数":  cv,
+            "CVR(%)":     round(cv / shinki * 100, 1) if shinki > 0 else None,
+        })
+
+    result = (
+        pd.DataFrame(records)
+        .sort_values("_week_start", ascending=False)
+        .head(n_weeks)
+        .sort_values("_week_start")
+        .drop(columns=["_week_start"])
+        .reset_index(drop=True)
+    )
+    result.index += 1
+    result.index.name = "#"
+    return result
+
+
+def build_weekly_staff_df(
+    fact_df: pd.DataFrame,
+    store_codes: list[str],
+    n_weeks: int = 12,
+) -> pd.DataFrame:
+    """スタッフ × 週のセッション数・CVRを返す（直近 n_weeks 週）"""
+    df = _parse_dt(fact_df[
+        fact_df["店舗コード"].isin(store_codes) &
+        fact_df["スタッフID"].notna() &
+        (fact_df["スタッフID"] != "")
+    ])
+    if df.empty:
+        return pd.DataFrame()
+
+    # 対象週を絞る
+    top_weeks = sorted(df["_week"].unique(), reverse=True)[:n_weeks]
+    df = df[df["_week"].isin(top_weeks)]
+
+    records = []
+    for (week_start, sid), grp in df.groupby(["_week", "スタッフID"]):
+        shinki = grp[grp["初回"] == "1"]["会員ID"].nunique()
+        cv     = grp[(grp["初回"] == "1") & (grp["CV有無"] == "1")]["会員ID"].nunique()
+        staff_name = grp["スタッフ名"].iloc[0] if "スタッフ名" in grp.columns else sid
+        records.append({
+            "_week_start": week_start,
+            "週":          _week_label(week_start),
+            "スタッフ":    f"{staff_name}（{sid}）",
+            "セッション数": len(grp),
+            "来店会員数":  grp["会員ID"].nunique(),
+            "新規数":      shinki,
+            "新規獲得数":  cv,
+            "CVR(%)":     round(cv / shinki * 100, 1) if shinki > 0 else None,
+        })
+
+    return (
+        pd.DataFrame(records)
+        .sort_values(["スタッフ", "_week_start"])
+        .drop(columns=["_week_start"])
+        .reset_index(drop=True)
+    )
 
 
 # ── 期間集計 ─────────────────────────────────────────────────
@@ -741,10 +836,11 @@ st.divider()
 
 
 # ── タブ ──────────────────────────────────────────────────────
-tab_summary, tab_store, tab_staff = st.tabs([
+tab_summary, tab_store, tab_staff, tab_weekly = st.tabs([
     "🏢 全店舗サマリー",
     "📈 店舗実績",
     "👤 スタッフ別",
+    "📅 週次推移",
 ])
 
 
@@ -1132,3 +1228,98 @@ with tab_staff:
 
                 st.divider()
                 render_comments(period_key, selected_store, selected_staff)
+
+
+# ── Tab 4: 週次推移 ───────────────────────────────────────────
+with tab_weekly:
+    st.subheader(f"週次推移（{clean_label(selected_store)}）")
+    st.caption("⚠️ 週次で確認できるのは セッション数・来店会員数・新規数・CVR のみです（離脱数は月次のみ）")
+
+    n_weeks = st.select_slider("表示週数", options=[4, 8, 12, 16, 24], value=12)
+
+    fact_df_w  = load_member_data()
+    sc_w       = get_store_codes(selected_store)
+    df_weekly  = build_weekly_store_df(fact_df_w, sc_w, n_weeks=n_weeks)
+
+    if df_weekly.empty:
+        st.info("週次データがありません")
+    else:
+        # ── KPI サマリー（直近週 vs 前週）──────────────────────
+        if len(df_weekly) >= 2:
+            latest = df_weekly.iloc[-1]
+            prev   = df_weekly.iloc[-2]
+            m1, m2, m3, m4 = st.columns(4)
+            def week_metric(col, label, key):
+                v = latest.get(key)
+                p = prev.get(key)
+                delta = round(v - p, 1) if isinstance(v, (int, float)) and isinstance(p, (int, float)) else None
+                col.metric(label, str(v) if v is not None else "—",
+                           delta=f"{delta:+.1f}" if delta is not None else None)
+            week_metric(m1, "来店会員数（直近週）", "来店会員数")
+            week_metric(m2, "セッション数（直近週）", "セッション数")
+            week_metric(m3, "新規獲得数（直近週）", "新規獲得数")
+            week_metric(m4, "CVR（直近週）", "CVR(%)")
+            st.caption(f"▲▼ は前週（{df_weekly.iloc[-2]['週']}）との比較")
+
+        st.divider()
+
+        # ── 週次トレンドグラフ（2行）────────────────────────────
+        _wl = dict(margin=dict(l=0, r=10, t=30, b=10), xaxis_title="", yaxis_title="", height=260)
+
+        row1_l, row1_r = st.columns(2)
+        with row1_l:
+            st.caption("セッション数（週別）")
+            fig_s = px.bar(df_weekly, x="週", y="セッション数",
+                           color_discrete_sequence=["#4a90d9"])
+            fig_s.update_layout(**_wl)
+            st.plotly_chart(fig_s, use_container_width=True)
+
+        with row1_r:
+            st.caption("来店会員数（週別）")
+            fig_v = px.line(df_weekly, x="週", y="来店会員数",
+                            markers=True, color_discrete_sequence=["#6366f1"])
+            fig_v.update_traces(line_width=2.5, marker_size=7)
+            fig_v.update_layout(**_wl)
+            st.plotly_chart(fig_v, use_container_width=True)
+
+        row2_l, row2_r = st.columns(2)
+        with row2_l:
+            st.caption("新規数・新規獲得数（週別）")
+            df_melt_w = df_weekly.melt(id_vars="週", value_vars=["新規数", "新規獲得数"],
+                                        var_name="指標", value_name="件数")
+            fig_n = px.bar(df_melt_w, x="週", y="件数", color="指標", barmode="group",
+                           color_discrete_map={"新規数": "#a3c4f3", "新規獲得数": "#4a90d9"},
+                           height=260)
+            fig_n.update_layout(**_wl,
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+            st.plotly_chart(fig_n, use_container_width=True)
+
+        with row2_r:
+            st.caption("CVR（週別）")
+            fig_c = px.line(df_weekly.dropna(subset=["CVR(%)"]),
+                            x="週", y="CVR(%)",
+                            markers=True, color_discrete_sequence=["#f0a500"])
+            fig_c.update_traces(line_width=2.5, marker_size=7)
+            fig_c.update_layout(**_wl)
+            st.plotly_chart(fig_c, use_container_width=True)
+
+        st.divider()
+
+        # ── 週次テーブル ────────────────────────────────────────
+        st.subheader("週次データ一覧")
+        st.dataframe(df_weekly, use_container_width=True)
+
+        st.divider()
+
+        # ── スタッフ別週次 ──────────────────────────────────────
+        with st.expander("スタッフ別 週次データを表示"):
+            df_wstaff = build_weekly_staff_df(fact_df_w, sc_w, n_weeks=n_weeks)
+            if df_wstaff.empty:
+                st.info("データがありません")
+            else:
+                staff_list_w = sorted(df_wstaff["スタッフ"].unique())
+                sel_w = st.selectbox("スタッフを絞り込む", ["全員"] + staff_list_w,
+                                     key="weekly_staff_sel")
+                if sel_w != "全員":
+                    df_wstaff = df_wstaff[df_wstaff["スタッフ"] == sel_w]
+                st.dataframe(df_wstaff.reset_index(drop=True), use_container_width=True)
