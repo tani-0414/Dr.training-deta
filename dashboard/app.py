@@ -402,6 +402,92 @@ def style_member_df(df: pd.DataFrame):
     return df.style.map(color_status, subset=["ステータス"])
 
 
+# ── 前期比ヘルパー ───────────────────────────────────────────
+
+def compute_prev_range(ym_range: list[str], all_months_asc: list[str]) -> list[str]:
+    """同じ長さの前期月リストを返す（データがなければ空リスト）"""
+    if not ym_range:
+        return []
+    n   = len(ym_range)
+    try:
+        idx = all_months_asc.index(ym_range[0])
+    except ValueError:
+        return []
+    if idx < n:
+        return []
+    return all_months_asc[idx - n: idx]
+
+
+def _fmt_delta(curr, prev, is_rate: bool = False, higher_better: bool = True):
+    """(差分テキスト, delta_color) を返す"""
+    if curr is None or prev is None:
+        return None, "normal"
+    diff = curr - prev
+    pct  = diff / abs(prev) * 100 if prev != 0 else None
+    unit = "pt" if is_rate else ""
+    sign = "+" if diff >= 0 else ""
+    pct_str = f" ({sign}{pct:.1f}%)" if pct is not None else ""
+    text = f"{sign}{diff:.1f}{unit}{pct_str}"
+    color = "normal" if (diff > 0) == higher_better else "inverse"
+    return text, color
+
+
+def build_comparison_df(eff_curr: dict, eff_prev: dict) -> pd.DataFrame:
+    """全店舗の今期 vs 前期 比較テーブル"""
+    cols_def = [
+        ("アクティブ会員", "active",       True,  False),
+        ("新規獲得数",      "shinki_cv",   True,  False),
+        ("CVR(%)",         "cvr",         True,  True),
+        ("離脱数",          "risseki",     False, False),
+        ("離脱率(%)",       "risseki_rate",False, True),
+        ("会員増減数",      "zougen",      True,  False),
+    ]
+    records = []
+    for lbl, r in eff_curr.items():
+        pr = eff_prev.get(lbl, {})
+        row: dict = {"店舗": clean_label(lbl)}
+        for col, key, hb, is_r in cols_def:
+            curr = _float(r.get(key)) if is_r else r.get(key)
+            prev = _float(pr.get(key)) if is_r else pr.get(key)
+            row[col] = curr
+            if curr is not None and prev is not None:
+                row[f"{col}△"] = round(curr - prev, 1)
+            else:
+                row[f"{col}△"] = None
+        records.append(row)
+    df = pd.DataFrame(records)
+    if not df.empty and "会員増減数△" in df.columns:
+        df = df.sort_values("会員増減数△", ascending=False, na_position="last")
+    return df.reset_index(drop=True)
+
+
+def style_comparison_df(df: pd.DataFrame) -> pd.Styler:
+    """△列を改善=緑 / 悪化=赤でスタイリング"""
+    hb_map = {
+        "アクティブ会員△": True,
+        "新規獲得数△":      True,
+        "CVR(%)△":         True,
+        "離脱数△":          False,
+        "離脱率(%)△":       False,
+        "会員増減数△":      True,
+    }
+    def _color(val, hb):
+        if not isinstance(val, (int, float)):
+            return ""
+        if val > 0:
+            return "background-color:#c3e6cb;color:#0d4f20;font-weight:700" if hb \
+                   else "background-color:#f5b7b1;color:#6b0000;font-weight:700"
+        if val < 0:
+            return "background-color:#f5b7b1;color:#6b0000;font-weight:700" if hb \
+                   else "background-color:#c3e6cb;color:#0d4f20;font-weight:700"
+        return ""
+    styler = df.style.format(na_rep="—", precision=1)
+    for col, hb in hb_map.items():
+        if col in df.columns:
+            styler = styler.map(lambda v, h=hb: _color(v, h), subset=[col])
+    return styler
+
+
 # ── セッション数集計 ──────────────────────────────────────────
 
 def get_store_session_count(
@@ -802,10 +888,13 @@ with st.sidebar:
         stores_available = sorted(
             {lbl for lbl, d in store_data.items() if any(ym in d for ym in ym_range)}
         )
+        st.divider()
+        compare_mode = st.radio("比較軸", ["全店舗平均", "前期比"], horizontal=True)
     else:
         # 週次モードは直近N週で表示（期間選択不要）
-        ym_range     = all_months       # 後続の一部処理で使われる変数をデフォルト設定
+        ym_range     = all_months
         period_label = "週次"
+        compare_mode = "全店舗平均"   # 週次では使わないが変数を定義しておく
         stores_available = sorted(store_data.keys())
 
     selected_store = st.selectbox("店舗", stores_available, format_func=clean_label)
@@ -839,6 +928,15 @@ if granularity == "📊 月次":
     avg_s      = _avgs(eff_store)
     avg_st     = _avgs(eff_staff)
     period_key = period_label
+
+    # 前期データ（前期比モード用）
+    prev_ym_range  = compute_prev_range(ym_range, all_months_asc)
+    eff_store_prev = get_effective_store(store_data, prev_ym_range) if prev_ym_range else {}
+    eff_staff_prev = get_effective_staff(all_staff_data, selected_store, prev_ym_range) \
+                     if prev_ym_range else {}
+    has_prev       = bool(prev_ym_range)
+    prev_label     = f"{fmt_month(prev_ym_range[0])}" if len(prev_ym_range) == 1 \
+                     else f"{fmt_month(prev_ym_range[0])} 〜 {fmt_month(prev_ym_range[-1])}"
 
 # ── タブ ──────────────────────────────────────────────────────
 if granularity == "📊 月次":
@@ -928,7 +1026,7 @@ if granularity == "📅 週次":
             st.dataframe(df_weekly, use_container_width=True)
 
     with tab_weekly_staff:
-        st.caption("📅 週次指標（スタッフ別）")
+        st.caption("📅 週次指標（スタッフ別）　｜　△ = 今週 − 前週")
         st.divider()
         n_weeks_s  = st.select_slider("表示週数", options=[4, 8, 12, 16, 24],
                                       value=12, key="ws_slider")
@@ -940,6 +1038,27 @@ if granularity == "📅 週次":
             sel_w = st.selectbox("スタッフを絞り込む", ["全員"] + staff_list_w,
                                  key="ws_staff_sel")
             show = df_wstaff if sel_w == "全員" else df_wstaff[df_wstaff["スタッフ"] == sel_w]
+
+            # 前週比 KPI（スタッフ絞り込み時のみ）
+            if sel_w != "全員":
+                staff_weeks = show.sort_values("週") if "週" in show.columns else show
+                if len(staff_weeks) >= 2:
+                    lw = staff_weeks.iloc[-1]
+                    pw = staff_weeks.iloc[-2]
+                    k1, k2, k3, k4 = st.columns(4)
+                    for col, label, key in [
+                        (k1, "セッション数（直近週）", "セッション数"),
+                        (k2, "来店会員数（直近週）",   "来店会員数"),
+                        (k3, "新規獲得数（直近週）",   "新規獲得数"),
+                        (k4, "CVR（直近週）",          "CVR(%)"),
+                    ]:
+                        v = lw.get(key); p = pw.get(key)
+                        d = round(v - p, 1) if isinstance(v, (int, float)) and isinstance(p, (int, float)) else None
+                        col.metric(label, str(v) if v is not None else "—",
+                                   delta=f"{d:+.1f}" if d is not None else None)
+                    st.caption(f"▲▼ は前週（{pw.get('週', '')}）との比較")
+                    st.divider()
+
             st.dataframe(show.reset_index(drop=True), use_container_width=True)
 
     st.stop()  # 以降の月次コードは実行しない
@@ -987,6 +1106,17 @@ with tab_summary:
         with col4: st.metric("合計 CVR", total_cvr)
         with col5: st.metric("合計 離脱数", sum_risseki)
         with col6: st.metric("合計 会員増減数", sum_zougen)
+
+    # ── 前期比テーブル ───────────────────────────────────────
+    if compare_mode == "前期比":
+        st.divider()
+        if not has_prev:
+            st.info("前期データがありません（最古の期間が選択されています）")
+        else:
+            st.subheader(f"全店舗 前期比（{prev_label} → {period_label}）")
+            st.caption("△列：🟢 改善　🔴 悪化")
+            df_cmp = build_comparison_df(eff_store, eff_store_prev)
+            st.dataframe(style_comparison_df(df_cmp), use_container_width=True)
 
 
 # ── Tab 2: 店舗実績 ───────────────────────────────────────────
@@ -1038,26 +1168,40 @@ with tab_store:
             ("会員増減数",       "zougen",       True,  False),
         ]
 
-        cols = st.columns(4)
+        tr_prev = eff_store_prev.get(selected_store, {})
+        cols    = st.columns(4)
         for i, (label, key, higher_better, is_rate) in enumerate(kpi_defs):
-            raw   = tr.get(key)
-            val   = _float(raw) if is_rate else (raw if isinstance(raw, (int, float)) else None)
-            avg   = avg_s.get(key)
-            delta = round(val - avg, 1) if val is not None and avg is not None else None
-            disp  = str(raw) if raw is not None else "—"
+            raw  = tr.get(key)
+            val  = _float(raw) if is_rate else (raw if isinstance(raw, (int, float)) else None)
+            disp = str(raw) if raw is not None else "—"
 
-            with cols[i % 4]:
-                st.metric(
-                    label=label,
-                    value=disp,
-                    delta=f"{delta:+.1f}" if delta is not None else None,
-                    delta_color="normal" if higher_better else "inverse",
-                    help=f"全店舗平均: {avg:.1f}{'%' if is_rate else ''}" if avg else None,
-                )
+            if compare_mode == "前期比" and has_prev:
+                prev_raw  = tr_prev.get(key)
+                prev_val  = _float(prev_raw) if is_rate else (prev_raw if isinstance(prev_raw, (int, float)) else None)
+                d_text, d_color = _fmt_delta(val, prev_val, is_rate, higher_better)
+                prev_disp = str(prev_raw) if prev_raw is not None else "—"
+                with cols[i % 4]:
+                    st.metric(label=label, value=disp,
+                              delta=d_text, delta_color=d_color)
+                    st.caption(f"前期: {prev_disp}")
+            else:
+                avg   = avg_s.get(key)
+                delta = round(val - avg, 1) if val is not None and avg is not None else None
+                with cols[i % 4]:
+                    st.metric(
+                        label=label, value=disp,
+                        delta=f"{delta:+.1f}" if delta is not None else None,
+                        delta_color="normal" if higher_better else "inverse",
+                        help=f"全店舗平均: {avg:.1f}{'%' if is_rate else ''}" if avg else None,
+                    )
 
         st.divider()
-        note = f"{len(ym_range)}ヶ月の合計（アクティブ会員数は平均）" if len(ym_range) > 1 else ""
-        st.caption(f"δ = 選択店舗 − 全店舗平均　｜　ホバーで平均値を表示　{note}")
+        if compare_mode == "前期比" and has_prev:
+            note = f"{len(ym_range)}ヶ月の合計（アクティブ会員数は平均）" if len(ym_range) > 1 else ""
+            st.caption(f"△ = 今期（{period_label}）− 前期（{prev_label}）　{note}")
+        else:
+            note = f"{len(ym_range)}ヶ月の合計（アクティブ会員数は平均）" if len(ym_range) > 1 else ""
+            st.caption(f"δ = 選択店舗 − 全店舗平均　｜　ホバーで平均値を表示　{note}")
 
         # ── 月別推移グラフ（期間モードのみ）────────────────────
         if len(ym_range) > 1:
@@ -1137,6 +1281,40 @@ with tab_staff:
 
             styled_staff = style_staff_df(df_staff, avg_st)
             st.dataframe(styled_staff, use_container_width=True)
+
+            # ── 前期比テーブル（前期比モード時）──────────────────
+            if compare_mode == "前期比" and has_prev:
+                st.divider()
+                st.subheader(f"スタッフ前期比（{prev_label} → {period_label}）")
+                df_staff_prev = build_staff_df(eff_staff_prev)
+                eff_s_curr_dict = {row["スタッフ"]: row.to_dict() for _, row in
+                                   build_staff_df(eff_staff).iterrows()}
+                eff_s_prev_dict = {row["スタッフ"]: row.to_dict() for _, row in
+                                   df_staff_prev.iterrows()}
+                delta_cols = ["担当会員数", "CVR(%)", "離脱率(%)", "会員増減数"]
+                delta_hb   = {"担当会員数": True, "CVR(%)": True, "離脱率(%)": False, "会員増減数": True}
+                staff_cmp_rows = []
+                for lbl, curr_row in eff_s_curr_dict.items():
+                    prev_row = eff_s_prev_dict.get(lbl, {})
+                    r = {"スタッフ": clean_label(lbl)}
+                    for col in delta_cols:
+                        c = curr_row.get(col)
+                        p = prev_row.get(col)
+                        r[col] = c
+                        r[f"{col}△"] = round(c - p, 1) if isinstance(c, (int, float)) and isinstance(p, (int, float)) else None
+                    staff_cmp_rows.append(r)
+                df_scmp = pd.DataFrame(staff_cmp_rows)
+                hb_map_s = {f"{c}△": delta_hb[c] for c in delta_cols}
+                def _sc(v, hb):
+                    if not isinstance(v, (int, float)): return ""
+                    if v > 0: return "background-color:#c3e6cb;color:#0d4f20;font-weight:700" if hb else "background-color:#f5b7b1;color:#6b0000;font-weight:700"
+                    if v < 0: return "background-color:#f5b7b1;color:#6b0000;font-weight:700" if hb else "background-color:#c3e6cb;color:#0d4f20;font-weight:700"
+                    return ""
+                styler_s = df_scmp.style.format(na_rep="—", precision=1)
+                for col, hb in hb_map_s.items():
+                    if col in df_scmp.columns:
+                        styler_s = styler_s.map(lambda v, h=hb: _sc(v, h), subset=[col])
+                st.dataframe(styler_s, use_container_width=True)
 
             # ── 棒グラフ ──────────────────────────────────────
             st.divider()
@@ -1268,30 +1446,47 @@ with tab_staff:
                     ("会員増減数", "zougen",       True,  False),
                 ]
 
+                staff_row_prev = eff_staff_prev.get(selected_staff, {})
                 cols2 = st.columns(4)
                 for i, (label, key, higher_better, is_rate) in enumerate(kpi_staff):
                     if key == "_honsu":
-                        raw, val, avg, delta = honsu_val, honsu_val, None, None
+                        raw  = honsu_val
+                        val  = honsu_val
                         disp = str(honsu_val) if honsu_val is not None else "—"
+                        with cols2[i % 4]:
+                            st.metric(label=label, value=disp)
+                        continue
+
+                    raw  = staff_row.get(key)
+                    val  = _float(raw) if is_rate else (raw if isinstance(raw, (int, float)) else None)
+                    disp = str(raw) if raw is not None else "—"
+
+                    if compare_mode == "前期比" and has_prev:
+                        prev_raw = staff_row_prev.get(key)
+                        prev_val = _float(prev_raw) if is_rate else (prev_raw if isinstance(prev_raw, (int, float)) else None)
+                        d_text, d_color = _fmt_delta(val, prev_val, is_rate, higher_better)
+                        prev_disp = str(prev_raw) if prev_raw is not None else "—"
+                        with cols2[i % 4]:
+                            st.metric(label=label, value=disp, delta=d_text, delta_color=d_color)
+                            st.caption(f"前期: {prev_disp}")
                     else:
-                        raw   = staff_row.get(key)
-                        val   = _float(raw) if is_rate else (raw if isinstance(raw, (int, float)) else None)
                         avg   = avg_st.get(key)
                         delta = round(val - avg, 1) if val is not None and avg is not None else None
-                        disp  = str(raw) if raw is not None else "—"
-
-                    with cols2[i % 4]:
-                        st.metric(
-                            label=label,
-                            value=disp,
-                            delta=f"{delta:+.1f}" if delta is not None else None,
-                            delta_color="normal" if higher_better else "inverse",
-                            help=f"店舗平均: {avg:.1f}{'%' if is_rate else ''}" if avg else None,
-                        )
+                        with cols2[i % 4]:
+                            st.metric(
+                                label=label, value=disp,
+                                delta=f"{delta:+.1f}" if delta is not None else None,
+                                delta_color="normal" if higher_better else "inverse",
+                                help=f"店舗平均: {avg:.1f}{'%' if is_rate else ''}" if avg else None,
+                            )
 
                 st.divider()
-                note = f"{len(ym_range)}ヶ月の合計（アクティブ会員数・来店頻度は平均）" if len(ym_range) > 1 else ""
-                st.caption(f"δ = スタッフ − 店舗平均　{note}")
+                if compare_mode == "前期比" and has_prev:
+                    note = f"{len(ym_range)}ヶ月の合計（アクティブ会員数・来店頻度は平均）" if len(ym_range) > 1 else ""
+                    st.caption(f"△ = 今期（{period_label}）− 前期（{prev_label}）　{note}")
+                else:
+                    note = f"{len(ym_range)}ヶ月の合計（アクティブ会員数・来店頻度は平均）" if len(ym_range) > 1 else ""
+                    st.caption(f"δ = スタッフ − 店舗平均　{note}")
 
                 # ── 月別推移グラフ（期間モードのみ）────────────
                 if len(ym_range) > 1:
